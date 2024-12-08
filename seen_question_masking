@@ -1,0 +1,133 @@
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from datasets import load_dataset
+from huggingface_hub import login
+
+# Login to Hugging Face Hub
+login(token="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")
+
+# Load LLama-2-7b model and tokenizer
+model_name = "meta-llama/Llama-2-7b-chat-hf"  # Replace with 8B when available
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    device_map="auto",  # Automatically maps the model to available GPUs
+    torch_dtype=torch.float16  # Use mixed precision for better performance
+)
+
+# Ensure the tokenizer has a padding token
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+# Load the MMLU Anatomy dataset
+def load_anatomy_questions():
+    """
+    Load the MMLU Anatomy dataset and extract the questions.
+    """
+    # Load the Anatomy subset of MMLU dataset
+    dataset = load_dataset("cais/mmlu", "anatomy", split="test")
+    
+    # Extract the questions from the dataset
+    questions = [item["question"] for item in dataset]
+    
+    return questions
+
+# Define a function to create the input prompt for detecting the keyword
+def create_keyword_prompt(question):
+    """
+    Creates the input prompt to ask the model for the keyword with a one-shot example.
+    """
+    prompt = (
+        "Extract the most important keyword in the following question. "
+        "The keyword is a single word that represents the main topic of the question. It should not be a word outside the question. It should also not be conjunction, article, or preposition. Your response should be exactly one word.\n"
+        "Example:\n"
+        "Q: Where did fortune cookies originate?\n"
+        "A: fortune\n\n"
+        f"Q: {question}\n"
+        f"A:"
+    )
+    return prompt
+
+# Define a function to create the input prompt for completing the sentence
+def create_completion_prompt(masked_question):
+    """
+    Creates the input prompt for the model to complete the masked sentence.
+    """
+    prompt = (
+        f"Guess the masked word in the question. Reply with the answer only. Respond in exactly one word.\n"
+        f"Q:Where did [MASK] cookies originate?\n"
+        f"A:fortune\n"
+        f"Q:{masked_question}\n"
+        f"A:"
+    )
+    return prompt
+
+# Define a function to query the model for predictions
+def predict_with_model(input_prompt):
+    """
+    Queries the model with a given input prompt.
+    """
+    inputs = tokenizer(
+        input_prompt,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        #return_attention_mask=True
+    ).to("cuda")
+    
+    with torch.no_grad():
+        outputs = model.generate(**inputs, 
+                                 max_length=250,
+                                # attention_mask=inputs.attention_mask,
+                                num_return_sequences=1
+                                )
+    predicted_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return predicted_text.strip()
+
+# Evaluate data leakage
+def check_data_leakage(questions):
+    results = []
+    matchCount = 0
+    for question in questions:
+        # Step 1: Predict the keyword
+        keyword_prompt = create_keyword_prompt(question)
+        predicted_keyword = predict_with_model(keyword_prompt)
+        if keyword_prompt in predicted_keyword:
+            predicted_keyword = predicted_keyword.replace(keyword_prompt, "").strip()
+        predicted_keyword = predicted_keyword.split("\n")
+        predicted_keyword = predicted_keyword[0]
+
+        # Step 2: Mask the predicted keyword
+        masked_question = question.replace(predicted_keyword, "[MASK]")
+        print(f"Question: {question}\n")
+        print(f"masked_question: {masked_question}\n")
+        print(f"predicted keyword: {predicted_keyword}\n")
+
+        # Step 3: Ask the model to complete the masked question
+        completion_prompt = create_completion_prompt(masked_question)
+        predicted_completion = predict_with_model(completion_prompt)
+        if completion_prompt in predicted_completion:
+            predicted_completion = predicted_completion.replace(completion_prompt, "").strip()
+        predicted_completion = predicted_completion.split("\n")[0]
+        print(f"output: {predicted_completion}\n")
+
+        if predicted_completion == predicted_keyword:
+            if predicted_keyword in question:
+                matchCount = matchCount+1
+                print("Its a match!\n")
+        # Record the result
+        results.append({
+            "question": question,
+            "predicted_keyword": predicted_keyword,
+            "masked_question": masked_question,
+            "predicted_completion": predicted_completion,
+        })
+    return matchCount
+
+# Load MMLU Anatomy dataset questions
+questions = load_anatomy_questions()
+
+# Check data leakage
+results = check_data_leakage(questions)  # Use a subset for testing
+finalResult = 100*results/len(questions)
+print(f"Data Leakage percentage: {finalResult}\n")
